@@ -1,78 +1,109 @@
-import os
-import requests
-from flask import Flask, request, jsonify, make_response
+from flask import Flask, request, jsonify
 from flask_cors import CORS
+import requests
+import os
 
 app = Flask(__name__)
-CORS(app, origins="*")
+CORS(app, origins="*", allow_headers=["Content-Type", "Authorization"], methods=["GET", "POST", "OPTIONS"])
 
 SYNTHESIA_API_KEY = os.environ.get("SYNTHESIA_API_KEY", "")
-SYNTHESIA_BASE_URL = "https://api.synthesia.io/v2"
-
-CORS_HEADERS = {
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, Authorization",
-}
-
-
-def cors_response(data, status=200):
-    resp = make_response(jsonify(data), status)
-    for key, value in CORS_HEADERS.items():
-        resp.headers[key] = value
-    return resp
-
-
-def get_auth_headers():
-    return {
-        "Authorization": SYNTHESIA_API_KEY,
-        "Content-Type": "application/json",
-    }
-
+AVATAR_ID = "avatar_2b2f974b-78fc-4f63-a5bc-b4dcea6e9151"
 
 @app.after_request
 def add_cors_headers(response):
-    for key, value in CORS_HEADERS.items():
-        response.headers[key] = value
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
     return response
 
-
 @app.route("/", methods=["GET", "OPTIONS"])
-def health_check():
-    if request.method == "OPTIONS":
-        return cors_response({}, 200)
-    return cors_response({"status": "ok", "service": "Synthesia API Proxy"})
-
+def health():
+    return jsonify({"service": "Synthesia API Proxy", "status": "ok"})
 
 @app.route("/create-video", methods=["POST", "OPTIONS"])
 def create_video():
     if request.method == "OPTIONS":
-        return cors_response({}, 200)
+        return jsonify({"status": "ok"}), 200
+
     try:
-        payload = request.get_json(force=True, silent=True) or {}
-        response = requests.post(
-            f"{SYNTHESIA_BASE_URL}/videos",
+        body = request.get_json()
+        title = body.get("title", "SAFE Enablement Video")
+        script = body.get("script", "")
+        avatar_id = body.get("avatar_id", AVATAR_ID)
+
+        if not script:
+            return jsonify({"error": "No script provided"}), 400
+
+        script = script[:3000]
+
+        payload = {
+            "test": False,
+            "title": title,
+            "input": [{
+                "avatarSettings": {
+                    "horizontalAlign": "center",
+                    "scale": 1,
+                    "style": "rectangular"
+                },
+                "backgroundSettings": {
+                    "videoColor": "#08060f"
+                },
+                "avatar": avatar_id,
+                "script": {
+                    "type": "text",
+                    "input": script
+                }
+            }],
+            "aspectRatio": "16:9"
+        }
+
+        resp = requests.post(
+            "https://api.synthesia.io/v2/videos",
             json=payload,
-            headers=get_auth_headers(),
+            headers={
+                "Authorization": SYNTHESIA_API_KEY,
+                "Content-Type": "application/json"
+            }
         )
-        return cors_response(response.json(), response.status_code)
-    except requests.RequestException as e:
-        return cors_response({"error": str(e)}, 502)
+
+        if resp.ok:
+            data = resp.json()
+            return jsonify({
+                "success": True,
+                "video_id": data.get("id"),
+                "status": data.get("status"),
+                "message": "Video submitted to Synthesia successfully"
+            })
+        else:
+            return jsonify({"error": f"Synthesia error {resp.status_code}: {resp.text}"}), resp.status_code
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/video-status/<video_id>", methods=["GET", "OPTIONS"])
 def video_status(video_id):
     if request.method == "OPTIONS":
-        return cors_response({}, 200)
+        return jsonify({"status": "ok"}), 200
     try:
-        response = requests.get(
-            f"{SYNTHESIA_BASE_URL}/videos/{video_id}",
-            headers=get_auth_headers(),
+        resp = requests.get(
+            f"https://api.synthesia.io/v2/videos/{video_id}",
+            headers={"Authorization": SYNTHESIA_API_KEY}
         )
-        return cors_response(response.json(), response.status_code)
-    except requests.RequestException as e:
-        return cors_response({"error": str(e)}, 502)
+        if resp.ok:
+            data = resp.json()
+            return jsonify({
+                "video_id": video_id,
+                "status": data.get("status"),
+                "download_url": data.get("download", ""),
+                "duration": data.get("duration", 0)
+            })
+        else:
+            return jsonify({"error": f"Synthesia error {resp.status_code}"}), resp.status_code
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080, debug=False)
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host="0.0.0.0", port=port)
