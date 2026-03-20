@@ -100,6 +100,21 @@ def video_status(video_id):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route("/get-avatars", methods=["GET", "OPTIONS"])
+def get_avatars():
+    if request.method == "OPTIONS":
+        return jsonify({"status": "ok"}), 200
+    try:
+        resp = requests.get(
+            "https://api.synthesia.io/v2/avatars",
+            headers={"Authorization": SYNTHESIA_API_KEY}
+        )
+        if resp.ok:
+            return jsonify(resp.json())
+        else:
+            return jsonify({"error": f"Synthesia error {resp.status_code}: {resp.text}"}), resp.status_code
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8080))
