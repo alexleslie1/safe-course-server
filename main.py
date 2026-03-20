@@ -35,6 +35,7 @@ def create_video():
 
         script = script[:3000]
 
+        # First get available backgrounds from Synthesia
         payload = {
             "title": title,
             "visibility": "private",
@@ -47,10 +48,8 @@ def create_video():
                         "style": "rectangular",
                         "seamless": False
                     },
-                    "script": {
-                        "type": "text",
-                        "input": script
-                    }
+                    "background": "off_white",
+                    "scriptText": script
                 }
             ]
         }
