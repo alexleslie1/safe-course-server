@@ -24,7 +24,6 @@ def health():
 def create_video():
     if request.method == "OPTIONS":
         return jsonify({"status": "ok"}), 200
-
     try:
         body = request.get_json()
         title = body.get("title", "SAFE Enablement Video")
@@ -37,24 +36,23 @@ def create_video():
         script = script[:3000]
 
         payload = {
-            "test": False,
             "title": title,
-            "input": [{
-                "avatarSettings": {
-                    "horizontalAlign": "center",
-                    "scale": 1,
-                    "style": "rectangular"
-                },
-                "backgroundSettings": {
-                    "videoColor": "#08060f"
-                },
-                "avatar": avatar_id,
-                "script": {
-                    "type": "text",
-                    "input": script
+            "visibility": "private",
+            "input": [
+                {
+                    "avatar": avatar_id,
+                    "avatarSettings": {
+                        "horizontalAlign": "center",
+                        "scale": 1.0,
+                        "style": "rectangular",
+                        "seamless": False
+                    },
+                    "script": {
+                        "type": "text",
+                        "input": script
+                    }
                 }
-            }],
-            "aspectRatio": "16:9"
+            ]
         }
 
         resp = requests.post(
