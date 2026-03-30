@@ -52,8 +52,7 @@ def create_video():
                         "speed": 1.0
                     },
                     "background": {
-                        "type": "color",
-                        "value": "#08060f"
+                        "type": "transparent"
                     }
                 }
             ],
