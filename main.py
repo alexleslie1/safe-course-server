@@ -208,14 +208,17 @@ def batch_create_videos():
     if len(videos) > 50:
         return jsonify({"error": "Max 50 videos per batch"}), 400
 
-    results = [None] * len(videos)
+    results = []
 
     # Fire all HeyGen submissions in parallel. HeyGen rate limits are
     # generous enough for 10-20 concurrent submissions.
     with ThreadPoolExecutor(max_workers=10) as executor:
         future_to_index = {}
         for item in videos:
-            idx = item.get("index", videos.index(item))
+            # Preserve the caller's index so the frontend can match results
+            # back to module positions — even when those indexes are sparse
+            # (e.g. only avatar modules out of a mixed list).
+            idx = item.get("index", 0)
             future = executor.submit(
                 _create_single_video,
                 item.get("script", ""),
@@ -228,7 +231,10 @@ def batch_create_videos():
             idx = future_to_index[future]
             result = future.result()
             result["index"] = idx
-            results[idx] = result
+            results.append(result)
+
+    # Sort by original index so the frontend receives a predictable order.
+    results.sort(key=lambda r: r.get("index", 0))
 
     return jsonify({"results": results}), 200
 
