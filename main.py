@@ -5,16 +5,24 @@ Deployed on Railway: https://safe-course-server-production.up.railway.app
 Endpoints:
   POST /create-video          - Submit a single script to HeyGen
   GET  /video-status/<id>     - Poll status of a single video
-  POST /batch-create-videos   - Submit multiple scripts at once (NEW)
-  POST /batch-video-status    - Poll status of multiple videos at once (NEW)
+  POST /batch-create-videos   - Submit multiple scripts at once
+  POST /batch-video-status    - Poll status of multiple videos at once
   GET  /get-avatars           - List available HeyGen avatars
+  POST /compose-video         - Compose branded MP4 with title + bullets + avatar overlay
+  GET  /compose-status/<job>  - Check composition status and download result
 """
 
 import os
+import uuid
+import tempfile
+import subprocess
+import threading
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
+from PIL import Image, ImageDraw, ImageFont
+import io
 
 app = Flask(__name__)
 CORS(app)
@@ -296,6 +304,296 @@ def health():
         "service": "SAFE Course Generator - HeyGen Proxy",
         "has_api_key": bool(HEYGEN_API_KEY),
     }), 200
+
+
+# ============================================================
+# VIDEO COMPOSITION
+# Composes a branded MP4: dark background + title + bullets (left)
+# overlaid with the avatar video (right), matching the SCORM
+# player's visual layout.
+#
+# Uses ffmpeg for video processing and Pillow for generating
+# the background image. No headless browser required - keeps it
+# lightweight enough to run on Railway Hobby plan.
+# ============================================================
+
+# Canvas dimensions match the SCORM player layout
+CANVAS_W = 1920
+CANVAS_H = 1080
+BG_COLOR_RGB = (8, 6, 15)  # #08060f
+TEXT_COLOR = (255, 255, 255)
+BULLET_COLOR = (176, 126, 248)  # #b07ef8
+MUTED_COLOR = (209, 209, 217)
+
+# Avatar video position (left side of canvas) - 3:4 aspect ratio
+AVATAR_W = 700
+AVATAR_H = 933  # 3:4 aspect ratio
+AVATAR_X = 120
+AVATAR_Y = (CANVAS_H - AVATAR_H) // 2
+
+# Text area (right side of canvas)
+TEXT_X = 900
+TEXT_Y_START = 300
+TEXT_MAX_WIDTH = CANVAS_W - TEXT_X - 120
+
+# In-memory job store (simple dict, since we don't need persistence
+# across restarts for single-user use)
+_compose_jobs = {}
+_compose_jobs_lock = threading.Lock()
+
+
+def _get_font(size, bold=False):
+    """Load a font file with fallbacks. Returns PIL ImageFont."""
+    candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        "/System/Library/Fonts/Helvetica.ttc",
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            try:
+                return ImageFont.truetype(path, size)
+            except Exception:
+                continue
+    return ImageFont.load_default()
+
+
+def _wrap_text(text, font, max_width):
+    """Wrap text to fit within max_width. Returns list of line strings."""
+    words = text.split()
+    lines = []
+    current = []
+    for word in words:
+        test_line = " ".join(current + [word])
+        bbox = font.getbbox(test_line)
+        width = bbox[2] - bbox[0]
+        if width <= max_width:
+            current.append(word)
+        else:
+            if current:
+                lines.append(" ".join(current))
+            current = [word]
+    if current:
+        lines.append(" ".join(current))
+    return lines
+
+
+def _generate_background(title, bullets_text):
+    """
+    Build the dark-purple background image with title and bullets.
+    Returns a PIL Image at CANVAS_W x CANVAS_H.
+    """
+    img = Image.new("RGB", (CANVAS_W, CANVAS_H), BG_COLOR_RGB)
+    draw = ImageDraw.Draw(img)
+
+    # Optional: subtle purple glow behind text area
+    # (Drawing a radial gradient is expensive; skip for now - solid bg is fine)
+
+    # Draw the title
+    title_font = _get_font(56, bold=True)
+    title_lines = _wrap_text(title or "", title_font, TEXT_MAX_WIDTH)
+    y = TEXT_Y_START
+    for line in title_lines:
+        draw.text((TEXT_X, y), line, font=title_font, fill=TEXT_COLOR)
+        y += 72
+    y += 30  # space after title
+
+    # Parse bullets (split by line, strip common bullet prefixes)
+    bullet_lines = []
+    for raw in (bullets_text or "").split("\n"):
+        stripped = raw.strip()
+        if not stripped:
+            continue
+        # Remove common prefix chars like -, •, *, ✓, etc.
+        cleaned = stripped.lstrip("-•*✓✔→▸· \t")
+        bullet_lines.append(cleaned)
+
+    # Draw bullets
+    bullet_font = _get_font(30)
+    for bullet in bullet_lines:
+        wrapped = _wrap_text(bullet, bullet_font, TEXT_MAX_WIDTH - 60)
+        # Gradient bullet marker (simplified: solid colored rectangle)
+        draw.rectangle([TEXT_X, y + 18, TEXT_X + 30, y + 22], fill=BULLET_COLOR)
+
+        # Bullet text
+        for i, line in enumerate(wrapped):
+            draw.text((TEXT_X + 50, y), line, font=bullet_font, fill=MUTED_COLOR)
+            y += 44
+        y += 22  # spacing between bullets
+        # Thin separator line
+        draw.line([(TEXT_X, y), (CANVAS_W - 120, y)], fill=(255, 255, 255, 20), width=1)
+        y += 14
+
+    return img
+
+
+def _compose_worker(job_id, avatar_video_url, title, bullets_text, round_corners=True):
+    """
+    Background worker that downloads the avatar MP4, generates the background,
+    and composes them into a final MP4 using ffmpeg. Updates _compose_jobs.
+    """
+    temp_dir = tempfile.mkdtemp(prefix="compose_")
+    try:
+        # 1. Download the avatar video
+        _update_job(job_id, status="downloading_avatar")
+        avatar_path = os.path.join(temp_dir, "avatar.mp4")
+        with requests.get(avatar_video_url, stream=True, timeout=120) as r:
+            r.raise_for_status()
+            with open(avatar_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    f.write(chunk)
+
+        # 2. Generate the background image with title + bullets
+        _update_job(job_id, status="generating_background")
+        bg_img = _generate_background(title, bullets_text)
+        bg_path = os.path.join(temp_dir, "background.png")
+        bg_img.save(bg_path, "PNG")
+
+        # 3. Use ffmpeg to compose: bg as base layer, avatar scaled + placed on top
+        _update_job(job_id, status="composing_video")
+        output_path = os.path.join(temp_dir, "output.mp4")
+
+        # Filter chain:
+        # - Scale avatar video to AVATAR_W x AVATAR_H (preserving aspect)
+        # - Zoom slightly and crop to hide chair/legs (matches our CSS `scale(1.25)`)
+        # - Overlay on background at AVATAR_X, AVATAR_Y
+        avatar_zoom = 1.25
+        zoomed_w = int(AVATAR_W * avatar_zoom)
+        zoomed_h = int(AVATAR_H * avatar_zoom)
+        crop_x = (zoomed_w - AVATAR_W) // 2
+        crop_y = int((zoomed_h - AVATAR_H) * 0.25)  # shift up slightly
+
+        filter_complex = (
+            f"[1:v]scale={zoomed_w}:{zoomed_h}:force_original_aspect_ratio=increase,"
+            f"crop={AVATAR_W}:{AVATAR_H}:{crop_x}:{crop_y}[avatar];"
+            f"[0:v][avatar]overlay={AVATAR_X}:{AVATAR_Y}:shortest=1[out]"
+        )
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-loop", "1", "-i", bg_path,  # input 0: background image (looped)
+            "-i", avatar_path,             # input 1: avatar video
+            "-filter_complex", filter_complex,
+            "-map", "[out]",
+            "-map", "1:a?",               # audio from avatar (optional)
+            "-c:v", "libx264",
+            "-preset", "medium",
+            "-crf", "23",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac",
+            "-b:a", "128k",
+            "-shortest",
+            output_path,
+        ]
+
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        if result.returncode != 0:
+            raise Exception(f"ffmpeg failed: {result.stderr[-800:]}")
+
+        # 4. Read the final MP4 into memory and clean up
+        _update_job(job_id, status="finalizing")
+        with open(output_path, "rb") as f:
+            final_bytes = f.read()
+
+        _update_job(job_id, status="completed", result_bytes=final_bytes)
+
+    except Exception as e:
+        import traceback
+        tb = traceback.format_exc()
+        _update_job(job_id, status="failed", error=f"{str(e)[:300]} | {tb[-600:]}")
+    finally:
+        # Cleanup temp dir
+        try:
+            import shutil
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        except Exception:
+            pass
+
+
+def _update_job(job_id, **kwargs):
+    with _compose_jobs_lock:
+        if job_id not in _compose_jobs:
+            _compose_jobs[job_id] = {}
+        _compose_jobs[job_id].update(kwargs)
+
+
+@app.route("/compose-video", methods=["POST"])
+def compose_video():
+    """
+    Kick off a composition job. Returns a job_id which the client
+    should poll via /compose-status/<job_id>.
+
+    Request body:
+      {
+        "video_url": "https://heygen.../video.mp4",
+        "title": "Module title",
+        "bullets": "bullet 1\\nbullet 2\\nbullet 3"
+      }
+    """
+    body = request.get_json() or {}
+    video_url = body.get("video_url")
+    title = body.get("title", "")
+    bullets = body.get("bullets", "")
+
+    if not video_url:
+        return jsonify({"error": "video_url is required"}), 400
+
+    job_id = str(uuid.uuid4())
+    _update_job(job_id, status="queued")
+
+    # Kick off background thread
+    thread = threading.Thread(
+        target=_compose_worker,
+        args=(job_id, video_url, title, bullets),
+        daemon=True,
+    )
+    thread.start()
+
+    return jsonify({"job_id": job_id, "status": "queued"}), 200
+
+
+@app.route("/compose-status/<job_id>", methods=["GET"])
+def compose_status(job_id):
+    """
+    Poll a composition job's status. If completed, returns a download URL.
+    If caller passes ?download=1 and job is complete, streams the MP4 directly.
+    """
+    with _compose_jobs_lock:
+        job = _compose_jobs.get(job_id)
+
+    if not job:
+        return jsonify({"error": "job not found"}), 404
+
+    status = job.get("status", "unknown")
+
+    if request.args.get("download") == "1" and status == "completed":
+        result_bytes = job.get("result_bytes")
+        if not result_bytes:
+            return jsonify({"error": "result not available"}), 500
+        return send_file(
+            io.BytesIO(result_bytes),
+            mimetype="video/mp4",
+            as_attachment=True,
+            download_name=f"composed-{job_id[:8]}.mp4",
+        )
+
+    response = {"job_id": job_id, "status": status}
+    if status == "failed":
+        response["error"] = job.get("error", "unknown error")
+    elif status == "completed":
+        response["download_url"] = f"/compose-status/{job_id}?download=1"
+        response["size_bytes"] = len(job.get("result_bytes", b""))
+
+    return jsonify(response), 200
+
+
+@app.route("/compose-cleanup/<job_id>", methods=["POST"])
+def compose_cleanup(job_id):
+    """Client calls this after downloading to free server memory."""
+    with _compose_jobs_lock:
+        if job_id in _compose_jobs:
+            del _compose_jobs[job_id]
+    return jsonify({"ok": True}), 200
 
 
 if __name__ == "__main__":
