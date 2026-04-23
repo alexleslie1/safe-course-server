@@ -1,2 +1,0 @@
-[phases.setup]
-aptPkgs = ["ffmpeg", "fonts-dejavu-core", "fonts-dejavu"]
