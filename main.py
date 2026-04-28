@@ -23,6 +23,8 @@ from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 from PIL import Image, ImageDraw, ImageFont
 import io
+import cv2
+import numpy as np
 
 app = Flask(__name__)
 CORS(app)
@@ -378,6 +380,81 @@ def _wrap_text(text, font, max_width):
     return lines
 
 
+def _detect_face_focal(video_path):
+    """
+    Open the video, sample a few frames, and find a face.
+    Returns (focal_x_pct, focal_y_pct) in 0-1 source coordinates,
+    or None if no face is found in any sampled frame.
+
+    We sample multiple frames because the very first frame might be
+    a fade-in or have eyes closed, which can throw off detection.
+    """
+    try:
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return None
+
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+        if width == 0 or height == 0:
+            cap.release()
+            return None
+
+        # Sample frames at 1s, 2s, 3s, 4s, 5s — skip very first frame
+        sample_seconds = [1, 2, 3, 4, 5]
+        face_cascade = cv2.CascadeClassifier(
+            cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+        )
+
+        face_centers = []  # list of (x_pct, y_pct, area_pct) tuples
+
+        for sec in sample_seconds:
+            frame_idx = int(sec * fps)
+            if frame_idx >= total_frames:
+                continue
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ok, frame = cap.read()
+            if not ok or frame is None:
+                continue
+
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            faces = face_cascade.detectMultiScale(
+                gray,
+                scaleFactor=1.1,
+                minNeighbors=5,
+                minSize=(80, 80),  # ignore tiny detections
+            )
+            if len(faces) == 0:
+                continue
+
+            # Pick the largest face if multiple detected (closest to camera)
+            largest = max(faces, key=lambda f: f[2] * f[3])
+            x, y, w, h = largest
+            cx = x + w / 2
+            cy = y + h / 2
+            area_pct = (w * h) / (width * height)
+            face_centers.append((cx / width, cy / height, area_pct))
+
+        cap.release()
+
+        if not face_centers:
+            return None
+
+        # Average the centers across sampled frames for stability
+        avg_x = sum(c[0] for c in face_centers) / len(face_centers)
+        avg_y = sum(c[1] for c in face_centers) / len(face_centers)
+
+        return (avg_x, avg_y)
+
+    except Exception as e:
+        # Face detection is optional — never let it crash the whole compose
+        print(f"Face detection failed: {e}")
+        return None
+
+
 def _generate_background(title, bullets_text):
     """
     Build the dark-purple background image with title and bullets.
@@ -467,17 +544,24 @@ def _compose_worker(job_id, avatar_video_url, title, bullets_text, round_corners
         # - Zoom slightly and crop to hide chair/legs (matches our CSS `scale(1.25)`)
         # - Overlay on background at AVATAR_X, AVATAR_Y
         # Crop the avatar so head/shoulders fill the slot.
-        # HeyGen renders at 1920x1080. Avatars are typically positioned
-        # right-of-center horizontally and upper-third vertically (face).
-        # We crop tightly around that focal point.
-        #
-        # Approach: scale the source to be much larger than the slot,
-        # then crop a window centered on the face area.
+        # Use face detection to find the actual face position in this video,
+        # so we crop tightly around it regardless of which avatar was rendered.
         SOURCE_W = 1920
         SOURCE_H = 1080
-        # Target focal point in source coordinates (face position)
-        FOCAL_X_PCT = 0.62   # 62% from left (Caroline-style framing)
-        FOCAL_Y_PCT = 0.38   # 38% from top (face area)
+
+        _update_job(job_id, status="detecting_face")
+        detected = _detect_face_focal(avatar_path)
+        if detected is not None:
+            face_x_pct, face_y_pct = detected
+            # Position the face slightly above center vertically so the
+            # crop captures more body below than empty space above
+            FOCAL_X_PCT = face_x_pct
+            FOCAL_Y_PCT = face_y_pct + 0.10  # shift down a bit for shoulder room
+        else:
+            # Fallback: assume center-right framing common to HeyGen avatars
+            FOCAL_X_PCT = 0.50
+            FOCAL_Y_PCT = 0.40
+
         # How much of the source to capture (smaller = tighter zoom)
         CROP_W_PCT = 0.30    # capture 30% of source width
         CROP_H_PCT = 0.65    # capture 65% of source height (head + upper body)
