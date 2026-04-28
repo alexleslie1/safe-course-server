@@ -427,21 +427,30 @@ def _generate_background(title, bullets_text):
     return img
 
 
-def _compose_worker(job_id, avatar_video_url, title, bullets_text, round_corners=True):
+def _compose_worker(job_id, avatar_video_url, title, bullets_text, round_corners=True, upload_temp_dir=None):
     """
-    Background worker that downloads the avatar MP4, generates the background,
-    and composes them into a final MP4 using ffmpeg. Updates _compose_jobs.
+    Background worker. avatar_video_url can be:
+      - http(s):// URL to download
+      - file:// path to a pre-uploaded local file
     """
     temp_dir = tempfile.mkdtemp(prefix="compose_")
     try:
-        # 1. Download the avatar video
-        _update_job(job_id, status="downloading_avatar")
-        avatar_path = os.path.join(temp_dir, "avatar.mp4")
-        with requests.get(avatar_video_url, stream=True, timeout=120) as r:
-            r.raise_for_status()
-            with open(avatar_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=8192):
-                    f.write(chunk)
+        # 1. Get the avatar video — either from URL or already-uploaded file
+        if avatar_video_url.startswith("file://"):
+            # File was uploaded directly; just use the path
+            _update_job(job_id, status="reading_avatar")
+            avatar_path = avatar_video_url.replace("file://", "")
+            if not os.path.exists(avatar_path):
+                raise Exception(f"Uploaded file missing: {avatar_path}")
+        else:
+            # Download from URL
+            _update_job(job_id, status="downloading_avatar")
+            avatar_path = os.path.join(temp_dir, "avatar.mp4")
+            with requests.get(avatar_video_url, stream=True, timeout=120) as r:
+                r.raise_for_status()
+                with open(avatar_path, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        f.write(chunk)
 
         # 2. Generate the background image with title + bullets
         _update_job(job_id, status="generating_background")
@@ -502,10 +511,12 @@ def _compose_worker(job_id, avatar_video_url, title, bullets_text, round_corners
         tb = traceback.format_exc()
         _update_job(job_id, status="failed", error=f"{str(e)[:300]} | {tb[-600:]}")
     finally:
-        # Cleanup temp dir
+        # Cleanup temp dirs (compose work + upload, if separate)
         try:
             import shutil
             shutil.rmtree(temp_dir, ignore_errors=True)
+            if upload_temp_dir and upload_temp_dir != temp_dir:
+                shutil.rmtree(upload_temp_dir, ignore_errors=True)
         except Exception:
             pass
 
@@ -520,28 +531,58 @@ def _update_job(job_id, **kwargs):
 @app.route("/compose-video", methods=["POST"])
 def compose_video():
     """
-    Kick off a composition job. Returns a job_id which the client
-    should poll via /compose-status/<job_id>.
+    Kick off a composition job. Two ways to provide the avatar video:
 
-    Request body:
-      {
-        "video_url": "https://heygen.../video.mp4",
-        "title": "Module title",
-        "bullets": "bullet 1\\nbullet 2\\nbullet 3"
-      }
+    OPTION A: Multipart file upload (preferred — bypasses HeyGen URL expiration)
+      POST with form fields:
+        - video: the MP4 file
+        - title: module title
+        - bullets: newline-separated bullets
+
+    OPTION B: JSON with URL (legacy — works if URL hasn't expired)
+      POST with JSON body:
+        {"video_url": "...", "title": "...", "bullets": "..."}
+
+    Returns: {"job_id": "...", "status": "queued"}
     """
+    # Detect mode by content type
+    if request.files and 'video' in request.files:
+        # File upload mode
+        video_file = request.files['video']
+        title = request.form.get("title", "")
+        bullets = request.form.get("bullets", "")
+
+        # Save uploaded video to a temp file the worker can read
+        temp_dir = tempfile.mkdtemp(prefix="upload_")
+        upload_path = os.path.join(temp_dir, "avatar.mp4")
+        video_file.save(upload_path)
+
+        job_id = str(uuid.uuid4())
+        _update_job(job_id, status="queued")
+
+        # Pass local file path to worker (with file:// scheme so worker knows to skip download)
+        thread = threading.Thread(
+            target=_compose_worker,
+            args=(job_id, "file://" + upload_path, title, bullets),
+            kwargs={"upload_temp_dir": temp_dir},
+            daemon=True,
+        )
+        thread.start()
+
+        return jsonify({"job_id": job_id, "status": "queued"}), 200
+
+    # JSON URL mode (legacy)
     body = request.get_json() or {}
     video_url = body.get("video_url")
     title = body.get("title", "")
     bullets = body.get("bullets", "")
 
     if not video_url:
-        return jsonify({"error": "video_url is required"}), 400
+        return jsonify({"error": "video_url required (or upload 'video' as multipart)"}), 400
 
     job_id = str(uuid.uuid4())
     _update_job(job_id, status="queued")
 
-    # Kick off background thread
     thread = threading.Thread(
         target=_compose_worker,
         args=(job_id, video_url, title, bullets),
@@ -594,6 +635,121 @@ def compose_cleanup(job_id):
         if job_id in _compose_jobs:
             del _compose_jobs[job_id]
     return jsonify({"ok": True}), 200
+
+
+@app.route("/compose-debug", methods=["POST"])
+def compose_debug():
+    """
+    Diagnostic: run a compose job SYNCHRONOUSLY and return:
+    - ffmpeg stdout/stderr
+    - output dimensions (probed with ffprobe)
+    - background PNG dimensions
+    - avatar video dimensions
+    Use this to figure out what's actually happening during composition.
+    """
+    body = request.get_json() or {}
+    video_url = body.get("video_url")
+    title = body.get("title", "Test Title")
+    bullets = body.get("bullets", "Bullet one\nBullet two")
+
+    if not video_url:
+        return jsonify({"error": "video_url is required"}), 400
+
+    temp_dir = tempfile.mkdtemp(prefix="debug_")
+    diag = {"steps": []}
+
+    try:
+        # Download avatar
+        avatar_path = os.path.join(temp_dir, "avatar.mp4")
+        with requests.get(video_url, stream=True, timeout=120) as r:
+            r.raise_for_status()
+            with open(avatar_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    f.write(chunk)
+        diag["avatar_size_bytes"] = os.path.getsize(avatar_path)
+        diag["steps"].append("avatar downloaded")
+
+        # Probe avatar
+        probe_avatar = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=width,height,pix_fmt,codec_name",
+             "-of", "default=noprint_wrappers=1", avatar_path],
+            capture_output=True, text=True, timeout=30
+        )
+        diag["avatar_probe"] = probe_avatar.stdout
+        diag["steps"].append("avatar probed")
+
+        # Generate background
+        bg_img = _generate_background(title, bullets)
+        bg_path = os.path.join(temp_dir, "background.png")
+        bg_img.save(bg_path, "PNG")
+        diag["bg_size_bytes"] = os.path.getsize(bg_path)
+        diag["bg_dimensions"] = f"{bg_img.width}x{bg_img.height}"
+        diag["steps"].append("background generated")
+
+        # Compose
+        output_path = os.path.join(temp_dir, "output.mp4")
+        avatar_zoom = 1.25
+        zoomed_w = int(AVATAR_W * avatar_zoom)
+        zoomed_h = int(AVATAR_H * avatar_zoom)
+        crop_x = (zoomed_w - AVATAR_W) // 2
+        crop_y = int((zoomed_h - AVATAR_H) * 0.25)
+
+        filter_complex = (
+            f"[1:v]scale={zoomed_w}:{zoomed_h}:force_original_aspect_ratio=increase,"
+            f"crop={AVATAR_W}:{AVATAR_H}:{crop_x}:{crop_y}[avatar];"
+            f"[0:v][avatar]overlay={AVATAR_X}:{AVATAR_Y}:shortest=1[out]"
+        )
+        diag["filter_complex"] = filter_complex
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-loop", "1", "-i", bg_path,
+            "-i", avatar_path,
+            "-filter_complex", filter_complex,
+            "-map", "[out]",
+            "-map", "1:a?",
+            "-c:v", "libx264",
+            "-preset", "ultrafast",  # faster for debug
+            "-crf", "28",
+            "-pix_fmt", "yuv420p",
+            "-c:a", "aac",
+            "-b:a", "128k",
+            "-shortest",
+            output_path,
+        ]
+        diag["ffmpeg_cmd"] = " ".join(cmd)
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        diag["ffmpeg_returncode"] = result.returncode
+        diag["ffmpeg_stderr_tail"] = result.stderr[-3000:] if result.stderr else ""
+        diag["steps"].append("ffmpeg ran")
+
+        # Probe output
+        if os.path.exists(output_path):
+            diag["output_size_bytes"] = os.path.getsize(output_path)
+            probe_out = subprocess.run(
+                ["ffprobe", "-v", "error", "-select_streams", "v:0",
+                 "-show_entries", "stream=width,height,pix_fmt,codec_name",
+                 "-of", "default=noprint_wrappers=1", output_path],
+                capture_output=True, text=True, timeout=30
+            )
+            diag["output_probe"] = probe_out.stdout
+        else:
+            diag["output_exists"] = False
+
+        return jsonify(diag), 200
+
+    except Exception as e:
+        import traceback
+        diag["exception"] = str(e)
+        diag["traceback"] = traceback.format_exc()[-2000:]
+        return jsonify(diag), 500
+    finally:
+        try:
+            import shutil
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
