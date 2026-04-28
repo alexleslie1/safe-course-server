@@ -466,15 +466,37 @@ def _compose_worker(job_id, avatar_video_url, title, bullets_text, round_corners
         # - Scale avatar video to AVATAR_W x AVATAR_H (preserving aspect)
         # - Zoom slightly and crop to hide chair/legs (matches our CSS `scale(1.25)`)
         # - Overlay on background at AVATAR_X, AVATAR_Y
-        avatar_zoom = 1.25
-        zoomed_w = int(AVATAR_W * avatar_zoom)
-        zoomed_h = int(AVATAR_H * avatar_zoom)
-        crop_x = (zoomed_w - AVATAR_W) // 2
-        crop_y = int((zoomed_h - AVATAR_H) * 0.25)  # shift up slightly
+        # Crop the avatar so head/shoulders fill the slot.
+        # HeyGen renders at 1920x1080. Avatars are typically positioned
+        # right-of-center horizontally and upper-third vertically (face).
+        # We crop tightly around that focal point.
+        #
+        # Approach: scale the source to be much larger than the slot,
+        # then crop a window centered on the face area.
+        SOURCE_W = 1920
+        SOURCE_H = 1080
+        # Target focal point in source coordinates (face position)
+        FOCAL_X_PCT = 0.62   # 62% from left (Caroline-style framing)
+        FOCAL_Y_PCT = 0.38   # 38% from top (face area)
+        # How much of the source to capture (smaller = tighter zoom)
+        CROP_W_PCT = 0.30    # capture 30% of source width
+        CROP_H_PCT = 0.65    # capture 65% of source height (head + upper body)
+
+        # Crop window in source coordinates
+        crop_w_src = int(SOURCE_W * CROP_W_PCT)
+        crop_h_src = int(SOURCE_H * CROP_H_PCT)
+        crop_x_src = max(0, int(SOURCE_W * FOCAL_X_PCT) - crop_w_src // 2)
+        crop_y_src = max(0, int(SOURCE_H * FOCAL_Y_PCT) - crop_h_src // 2)
+
+        # Make sure crop stays inside the frame
+        if crop_x_src + crop_w_src > SOURCE_W:
+            crop_x_src = SOURCE_W - crop_w_src
+        if crop_y_src + crop_h_src > SOURCE_H:
+            crop_y_src = SOURCE_H - crop_h_src
 
         filter_complex = (
-            f"[1:v]scale={zoomed_w}:{zoomed_h}:force_original_aspect_ratio=increase,"
-            f"crop={AVATAR_W}:{AVATAR_H}:{crop_x}:{crop_y}[avatar];"
+            f"[1:v]crop={crop_w_src}:{crop_h_src}:{crop_x_src}:{crop_y_src},"
+            f"scale={AVATAR_W}:{AVATAR_H}:flags=lanczos[avatar];"
             f"[0:v][avatar]overlay={AVATAR_X}:{AVATAR_Y}:shortest=1[out]"
         )
 
@@ -689,15 +711,25 @@ def compose_debug():
 
         # Compose
         output_path = os.path.join(temp_dir, "output.mp4")
-        avatar_zoom = 1.25
-        zoomed_w = int(AVATAR_W * avatar_zoom)
-        zoomed_h = int(AVATAR_H * avatar_zoom)
-        crop_x = (zoomed_w - AVATAR_W) // 2
-        crop_y = int((zoomed_h - AVATAR_H) * 0.25)
+        SOURCE_W = 1920
+        SOURCE_H = 1080
+        FOCAL_X_PCT = 0.62
+        FOCAL_Y_PCT = 0.38
+        CROP_W_PCT = 0.30
+        CROP_H_PCT = 0.65
+
+        crop_w_src = int(SOURCE_W * CROP_W_PCT)
+        crop_h_src = int(SOURCE_H * CROP_H_PCT)
+        crop_x_src = max(0, int(SOURCE_W * FOCAL_X_PCT) - crop_w_src // 2)
+        crop_y_src = max(0, int(SOURCE_H * FOCAL_Y_PCT) - crop_h_src // 2)
+        if crop_x_src + crop_w_src > SOURCE_W:
+            crop_x_src = SOURCE_W - crop_w_src
+        if crop_y_src + crop_h_src > SOURCE_H:
+            crop_y_src = SOURCE_H - crop_h_src
 
         filter_complex = (
-            f"[1:v]scale={zoomed_w}:{zoomed_h}:force_original_aspect_ratio=increase,"
-            f"crop={AVATAR_W}:{AVATAR_H}:{crop_x}:{crop_y}[avatar];"
+            f"[1:v]crop={crop_w_src}:{crop_h_src}:{crop_x_src}:{crop_y_src},"
+            f"scale={AVATAR_W}:{AVATAR_H}:flags=lanczos[avatar];"
             f"[0:v][avatar]overlay={AVATAR_X}:{AVATAR_Y}:shortest=1[out]"
         )
         diag["filter_complex"] = filter_complex
