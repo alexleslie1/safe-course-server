@@ -546,37 +546,51 @@ def _compose_worker(job_id, avatar_video_url, title, bullets_text, round_corners
         # Crop the avatar so head/shoulders fill the slot.
         # Use face detection to find the actual face position in this video,
         # so we crop tightly around it regardless of which avatar was rendered.
-        SOURCE_W = 1920
-        SOURCE_H = 1080
+
+        # First: detect the actual source video dimensions
+        cap_check = cv2.VideoCapture(avatar_path)
+        SOURCE_W = int(cap_check.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1920
+        SOURCE_H = int(cap_check.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 1080
+        cap_check.release()
+        print(f"[compose {job_id[:8]}] Source video: {SOURCE_W}x{SOURCE_H}", flush=True)
 
         _update_job(job_id, status="detecting_face")
         detected = _detect_face_focal(avatar_path)
         if detected is not None:
             face_x_pct, face_y_pct = detected
-            # Position the face slightly above center vertically so the
-            # crop captures more body below than empty space above
+            print(f"[compose {job_id[:8]}] Face detected at ({face_x_pct:.3f}, {face_y_pct:.3f})", flush=True)
+            # Position so face is in upper third of cropped slot (room for shoulders below)
             FOCAL_X_PCT = face_x_pct
-            FOCAL_Y_PCT = face_y_pct + 0.10  # shift down a bit for shoulder room
+            FOCAL_Y_PCT = face_y_pct + 0.15  # shift focal point down so face appears upper-third
         else:
-            # Fallback: assume center-right framing common to HeyGen avatars
+            print(f"[compose {job_id[:8]}] No face detected, using fallback", flush=True)
             FOCAL_X_PCT = 0.50
             FOCAL_Y_PCT = 0.40
 
         # How much of the source to capture (smaller = tighter zoom)
-        CROP_W_PCT = 0.30    # capture 30% of source width
-        CROP_H_PCT = 0.65    # capture 65% of source height (head + upper body)
+        # We want the slot's aspect ratio (700:933 = 0.75) to match the crop's aspect ratio
+        # so we don't squish/stretch the avatar
+        SLOT_ASPECT = AVATAR_W / AVATAR_H  # 0.75 (portrait)
 
-        # Crop window in source coordinates
-        crop_w_src = int(SOURCE_W * CROP_W_PCT)
+        # Pick crop height as % of source, then derive width to maintain slot aspect
+        CROP_H_PCT = 0.85  # capture 85% of source height (most of body)
         crop_h_src = int(SOURCE_H * CROP_H_PCT)
-        crop_x_src = max(0, int(SOURCE_W * FOCAL_X_PCT) - crop_w_src // 2)
-        crop_y_src = max(0, int(SOURCE_H * FOCAL_Y_PCT) - crop_h_src // 2)
+        crop_w_src = int(crop_h_src * SLOT_ASPECT)
 
-        # Make sure crop stays inside the frame
-        if crop_x_src + crop_w_src > SOURCE_W:
-            crop_x_src = SOURCE_W - crop_w_src
-        if crop_y_src + crop_h_src > SOURCE_H:
-            crop_y_src = SOURCE_H - crop_h_src
+        # If crop_w > source width, shrink everything proportionally
+        if crop_w_src > SOURCE_W:
+            crop_w_src = SOURCE_W
+            crop_h_src = int(crop_w_src / SLOT_ASPECT)
+
+        # Position crop window so face is at FOCAL_X_PCT, FOCAL_Y_PCT of source
+        crop_x_src = int(SOURCE_W * FOCAL_X_PCT) - crop_w_src // 2
+        crop_y_src = int(SOURCE_H * FOCAL_Y_PCT) - crop_h_src // 2
+
+        # Clamp inside frame bounds
+        crop_x_src = max(0, min(crop_x_src, SOURCE_W - crop_w_src))
+        crop_y_src = max(0, min(crop_y_src, SOURCE_H - crop_h_src))
+
+        print(f"[compose {job_id[:8]}] Crop: {crop_w_src}x{crop_h_src} at ({crop_x_src}, {crop_y_src})", flush=True)
 
         filter_complex = (
             f"[1:v]crop={crop_w_src}:{crop_h_src}:{crop_x_src}:{crop_y_src},"
