@@ -504,11 +504,15 @@ def _generate_background(title, bullets_text):
     return img
 
 
-def _compose_worker(job_id, avatar_video_url, title, bullets_text, round_corners=True, upload_temp_dir=None):
+def _compose_worker(job_id, avatar_video_url, title, bullets_text, round_corners=True, upload_temp_dir=None, timed_bullets=None):
     """
     Background worker. avatar_video_url can be:
       - http(s):// URL to download
       - file:// path to a pre-uploaded local file
+
+    timed_bullets: optional list of {text, appearAt} objects. If provided,
+    bullets are rendered progressively via ffmpeg drawtext with timing cues
+    instead of baked into the static background.
     """
     temp_dir = tempfile.mkdtemp(prefix="compose_")
     try:
@@ -531,7 +535,10 @@ def _compose_worker(job_id, avatar_video_url, title, bullets_text, round_corners
 
         # 2. Generate the background image with title + bullets
         _update_job(job_id, status="generating_background")
-        bg_img = _generate_background(title, bullets_text)
+        # If timed bullets are provided, generate background with title only -
+        # individual bullets will be drawn progressively via ffmpeg drawtext below
+        bg_bullets = "" if (timed_bullets and len(timed_bullets) > 0) else bullets_text
+        bg_img = _generate_background(title, bg_bullets)
         bg_path = os.path.join(temp_dir, "background.png")
         bg_img.save(bg_path, "PNG")
 
@@ -592,10 +599,57 @@ def _compose_worker(job_id, avatar_video_url, title, bullets_text, round_corners
 
         print(f"[compose {job_id[:8]}] Crop: {crop_w_src}x{crop_h_src} at ({crop_x_src}, {crop_y_src})", flush=True)
 
+        # Build drawtext filters for timed bullets if provided
+        timed_filter_chain = ""
+        if timed_bullets:
+            # Find a usable bold font for drawtext
+            font_path = None
+            for cand in [
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+                "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+            ]:
+                if os.path.exists(cand):
+                    font_path = cand
+                    break
+
+            if font_path:
+                # Layout matching _generate_background:
+                # TEXT_X=900, after title region. Bullets start ~y=420
+                BULLETS_Y_START = 420
+                BULLETS_LINE_HEIGHT = 80  # spacing between bullets
+                BULLET_X = 900
+                BULLET_FONT_SIZE = 30
+
+                # Build a chain of drawtext filters, each enabled at its appearAt time
+                drawtext_filters = []
+                for i, b in enumerate(timed_bullets):
+                    text = (b.get("text") or "").strip()
+                    if not text:
+                        continue
+                    appear_at = max(0, float(b.get("appearAt") or 0))
+                    y_pos = BULLETS_Y_START + i * BULLETS_LINE_HEIGHT
+
+                    # Escape text for ffmpeg drawtext: : and \ and ' need escaping
+                    safe_text = text.replace("\\", "\\\\\\\\").replace(":", "\\\\:").replace("'", "\\\\'")
+
+                    # Bullet marker: small purple rectangle drawn via drawbox
+                    # Then text drawn next to it
+                    drawtext_filters.append(
+                        f"drawbox=x={BULLET_X}:y={y_pos + 18}:w=20:h=4:color=0xb07ef8@1.0:t=fill:enable='gte(t,{appear_at})'"
+                    )
+                    drawtext_filters.append(
+                        f"drawtext=fontfile='{font_path}':text='{safe_text}':"
+                        f"x={BULLET_X + 40}:y={y_pos}:fontsize={BULLET_FONT_SIZE}:fontcolor=0xd1d1d9:"
+                        f"enable='gte(t,{appear_at})'"
+                    )
+
+                if drawtext_filters:
+                    timed_filter_chain = "," + ",".join(drawtext_filters)
+
         filter_complex = (
             f"[1:v]crop={crop_w_src}:{crop_h_src}:{crop_x_src}:{crop_y_src},"
             f"scale={AVATAR_W}:{AVATAR_H}:flags=lanczos[avatar];"
-            f"[0:v][avatar]overlay={AVATAR_X}:{AVATAR_Y}:shortest=1[out]"
+            f"[0:v][avatar]overlay={AVATAR_X}:{AVATAR_Y}:shortest=1{timed_filter_chain}[out]"
         )
 
         cmd = [
@@ -671,6 +725,14 @@ def compose_video():
         video_file = request.files['video']
         title = request.form.get("title", "")
         bullets = request.form.get("bullets", "")
+        timed_bullets_json = request.form.get("timedBullets", "")
+        timed_bullets = []
+        if timed_bullets_json:
+            try:
+                import json
+                timed_bullets = json.loads(timed_bullets_json)
+            except Exception:
+                timed_bullets = []
 
         # Save uploaded video to a temp file the worker can read
         temp_dir = tempfile.mkdtemp(prefix="upload_")
@@ -684,7 +746,7 @@ def compose_video():
         thread = threading.Thread(
             target=_compose_worker,
             args=(job_id, "file://" + upload_path, title, bullets),
-            kwargs={"upload_temp_dir": temp_dir},
+            kwargs={"upload_temp_dir": temp_dir, "timed_bullets": timed_bullets},
             daemon=True,
         )
         thread.start()
@@ -696,6 +758,7 @@ def compose_video():
     video_url = body.get("video_url")
     title = body.get("title", "")
     bullets = body.get("bullets", "")
+    timed_bullets = body.get("timedBullets", []) or []
 
     if not video_url:
         return jsonify({"error": "video_url required (or upload 'video' as multipart)"}), 400
@@ -706,6 +769,7 @@ def compose_video():
     thread = threading.Thread(
         target=_compose_worker,
         args=(job_id, video_url, title, bullets),
+        kwargs={"timed_bullets": timed_bullets},
         daemon=True,
     )
     thread.start()
