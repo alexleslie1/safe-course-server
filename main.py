@@ -635,9 +635,16 @@ def _compose_worker(job_id, avatar_video_url, title, bullets_text, round_corners
         if not regular_font:
             regular_font = bold_font
 
-        # Helper to escape ffmpeg drawtext strings
-        def escape_drawtext(s):
-            return s.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\\\'")
+        # Helper to write text to a temp file and return path.
+        # Using textfile= bypasses all the escaping pain that text= has
+        # (apostrophes, colons, special chars all become non-issues).
+        _text_counter = [0]
+        def text_to_file(s):
+            _text_counter[0] += 1
+            path = os.path.join(temp_dir, f"text_{_text_counter[0]}.txt")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(s)
+            return path
 
         # Layout constants matching the SCORM player look
         TITLE_X = 900
@@ -678,9 +685,9 @@ def _compose_worker(job_id, avatar_video_url, title, bullets_text, round_corners
                 # Title (per-scene)
                 scene_title = (scene.get("title") or "").strip()
                 if scene_title:
-                    safe_title = escape_drawtext(scene_title)
+                    title_path = text_to_file(scene_title)
                     scene_filter_parts.append(
-                        f"drawtext=fontfile='{bold_font}':text='{safe_title}':"
+                        f"drawtext=fontfile='{bold_font}':textfile='{title_path}':"
                         f"x={TITLE_X}:y={TITLE_Y}:fontsize={TITLE_FONT_SIZE}:fontcolor=white:"
                         f"enable='{t_filter}'"
                     )
@@ -693,14 +700,14 @@ def _compose_worker(job_id, avatar_video_url, title, bullets_text, round_corners
                         if not btext:
                             continue
                         y_pos = BULLETS_Y_START + j * BULLETS_LINE_HEIGHT
-                        safe_text = escape_drawtext(btext)
+                        bullet_path = text_to_file(btext)
 
                         scene_filter_parts.append(
                             f"drawbox=x={BULLET_X}:y={y_pos + 18}:w=20:h=4:color=0xb07ef8@1.0:t=fill:"
                             f"enable='{t_filter}'"
                         )
                         scene_filter_parts.append(
-                            f"drawtext=fontfile='{regular_font}':text='{safe_text}':"
+                            f"drawtext=fontfile='{regular_font}':textfile='{bullet_path}':"
                             f"x={BULLET_X + 40}:y={y_pos}:fontsize={BULLET_FONT_SIZE}:fontcolor=0xd1d1d9:"
                             f"enable='{t_filter}'"
                         )
@@ -727,13 +734,13 @@ def _compose_worker(job_id, avatar_video_url, title, bullets_text, round_corners
                     continue
                 appear_at = max(0, float(b.get("appearAt") or 0))
                 y_pos = BULLETS_Y_START + i * BULLETS_LINE_HEIGHT
-                safe_text = escape_drawtext(text)
+                legacy_path = text_to_file(text)
                 scene_filter_parts.append(
                     f"drawbox=x={BULLET_X}:y={y_pos + 18}:w=20:h=4:color=0xb07ef8@1.0:t=fill:"
                     f"enable='gte(t,{appear_at})'"
                 )
                 scene_filter_parts.append(
-                    f"drawtext=fontfile='{regular_font}':text='{safe_text}':"
+                    f"drawtext=fontfile='{regular_font}':textfile='{legacy_path}':"
                     f"x={BULLET_X + 40}:y={y_pos}:fontsize={BULLET_FONT_SIZE}:fontcolor=0xd1d1d9:"
                     f"enable='gte(t,{appear_at})'"
                 )
