@@ -504,15 +504,20 @@ def _generate_background(title, bullets_text):
     return img
 
 
-def _compose_worker(job_id, avatar_video_url, title, bullets_text, round_corners=True, upload_temp_dir=None, timed_bullets=None):
+def _compose_worker(job_id, avatar_video_url, title, bullets_text, round_corners=True, upload_temp_dir=None, timed_bullets=None, scenes=None):
     """
     Background worker. avatar_video_url can be:
       - http(s):// URL to download
       - file:// path to a pre-uploaded local file
 
-    timed_bullets: optional list of {text, appearAt} objects. If provided,
-    bullets are rendered progressively via ffmpeg drawtext with timing cues
-    instead of baked into the static background.
+    scenes: optional list of scene dicts. Each scene has:
+      - type: "bullets" or "image"
+      - startAt: float seconds when this scene becomes active
+      - title: optional string (per-scene title override)
+      - bullets: list of strings (if type=bullets)
+      - imagePath: local file path (if type=image)
+
+    timed_bullets: legacy list of {text, appearAt} objects (used if scenes not provided)
     """
     temp_dir = tempfile.mkdtemp(prefix="compose_")
     try:
@@ -599,63 +604,197 @@ def _compose_worker(job_id, avatar_video_url, title, bullets_text, round_corners
 
         print(f"[compose {job_id[:8]}] Crop: {crop_w_src}x{crop_h_src} at ({crop_x_src}, {crop_y_src})", flush=True)
 
-        # Build drawtext filters for timed bullets if provided
-        timed_filter_chain = ""
-        if timed_bullets:
-            # Find a usable bold font for drawtext
-            font_path = None
-            for cand in [
-                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-                "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-            ]:
-                if os.path.exists(cand):
-                    font_path = cand
-                    break
+        # ============================================================
+        # Build scene rendering filters
+        # Two paths:
+        #   A) scenes provided (modern): render each scene as a time-bounded
+        #      block (title + bullets or image). Earlier filter pipeline
+        #      drew everything onto bg image; now we draw dynamically.
+        #   B) timed_bullets only (legacy): draw bullets with gte(t,X) cues
+        # ============================================================
 
-            if font_path:
-                # Layout matching _generate_background:
-                # TEXT_X=900, after title region. Bullets start ~y=420
-                BULLETS_Y_START = 420
-                BULLETS_LINE_HEIGHT = 80  # spacing between bullets
-                BULLET_X = 900
-                BULLET_FONT_SIZE = 30
+        # Find a usable bold and regular font
+        bold_font = None
+        regular_font = None
+        for cand in [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+        ]:
+            if os.path.exists(cand):
+                bold_font = cand
+                break
+        for cand in [
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+        ]:
+            if os.path.exists(cand):
+                regular_font = cand
+                break
+        if not bold_font:
+            bold_font = regular_font
+        if not regular_font:
+            regular_font = bold_font
 
-                # Build a chain of drawtext filters, each enabled at its appearAt time
-                drawtext_filters = []
-                for i, b in enumerate(timed_bullets):
-                    text = (b.get("text") or "").strip()
-                    if not text:
-                        continue
-                    appear_at = max(0, float(b.get("appearAt") or 0))
-                    y_pos = BULLETS_Y_START + i * BULLETS_LINE_HEIGHT
+        # Helper to escape ffmpeg drawtext strings
+        def escape_drawtext(s):
+            return s.replace("\\", "\\\\").replace(":", "\\:").replace("'", "\\\\'")
 
-                    # Escape text for ffmpeg drawtext: : and \ and ' need escaping
-                    safe_text = text.replace("\\", "\\\\\\\\").replace(":", "\\\\:").replace("'", "\\\\'")
+        # Layout constants matching the SCORM player look
+        TITLE_X = 900
+        TITLE_Y = 300
+        TITLE_FONT_SIZE = 56
+        BULLETS_Y_START = 420
+        BULLETS_LINE_HEIGHT = 80
+        BULLET_X = 900
+        BULLET_FONT_SIZE = 30
+        IMAGE_X = 900
+        IMAGE_Y = 250
+        IMAGE_MAX_W = 880
+        IMAGE_MAX_H = 600
 
-                    # Bullet marker: small purple rectangle drawn via drawbox
-                    # Then text drawn next to it
-                    drawtext_filters.append(
-                        f"drawbox=x={BULLET_X}:y={y_pos + 18}:w=20:h=4:color=0xb07ef8@1.0:t=fill:enable='gte(t,{appear_at})'"
+        scene_filter_parts = []
+        extra_inputs = []   # list of (path, ffmpeg_input_index)
+        scene_specs = []   # populated only in scenes path; used by image overlay logic
+
+        if scenes and len(scenes) > 0 and bold_font:
+            # Build scenes with start/end times. Last scene runs to infinity.
+            for i, scene in enumerate(scenes):
+                start = max(0, float(scene.get("startAt") or 0))
+                end = float(scenes[i + 1]["startAt"]) if i + 1 < len(scenes) else 1e9
+                scene_specs.append({
+                    "scene": scene,
+                    "start": start,
+                    "end": end,
+                })
+
+            # Suppress the static bg title since each scene draws its own
+            # (we'll regenerate background without title)
+            for spec in scene_specs:
+                scene = spec["scene"]
+                start = spec["start"]
+                end = spec["end"]
+                t_filter = f"between(t,{start:.2f},{end:.2f})"
+
+                # Title (per-scene)
+                scene_title = (scene.get("title") or "").strip()
+                if scene_title:
+                    safe_title = escape_drawtext(scene_title)
+                    scene_filter_parts.append(
+                        f"drawtext=fontfile='{bold_font}':text='{safe_title}':"
+                        f"x={TITLE_X}:y={TITLE_Y}:fontsize={TITLE_FONT_SIZE}:fontcolor=white:"
+                        f"enable='{t_filter}'"
                     )
-                    drawtext_filters.append(
-                        f"drawtext=fontfile='{font_path}':text='{safe_text}':"
-                        f"x={BULLET_X + 40}:y={y_pos}:fontsize={BULLET_FONT_SIZE}:fontcolor=0xd1d1d9:"
-                        f"enable='gte(t,{appear_at})'"
-                    )
 
-                if drawtext_filters:
-                    timed_filter_chain = "," + ",".join(drawtext_filters)
+                stype = scene.get("type") or "bullets"
+                if stype == "bullets":
+                    bullets_list = scene.get("bullets") or []
+                    for j, btext in enumerate(bullets_list):
+                        btext = (btext or "").strip()
+                        if not btext:
+                            continue
+                        y_pos = BULLETS_Y_START + j * BULLETS_LINE_HEIGHT
+                        safe_text = escape_drawtext(btext)
 
-        filter_complex = (
-            f"[1:v]crop={crop_w_src}:{crop_h_src}:{crop_x_src}:{crop_y_src},"
-            f"scale={AVATAR_W}:{AVATAR_H}:flags=lanczos[avatar];"
-            f"[0:v][avatar]overlay={AVATAR_X}:{AVATAR_Y}:shortest=1{timed_filter_chain}[out]"
-        )
+                        scene_filter_parts.append(
+                            f"drawbox=x={BULLET_X}:y={y_pos + 18}:w=20:h=4:color=0xb07ef8@1.0:t=fill:"
+                            f"enable='{t_filter}'"
+                        )
+                        scene_filter_parts.append(
+                            f"drawtext=fontfile='{regular_font}':text='{safe_text}':"
+                            f"x={BULLET_X + 40}:y={y_pos}:fontsize={BULLET_FONT_SIZE}:fontcolor=0xd1d1d9:"
+                            f"enable='{t_filter}'"
+                        )
+                elif stype == "image" and scene.get("imagePath"):
+                    img_path = scene["imagePath"]
+                    if os.path.exists(img_path):
+                        # Each image becomes an extra ffmpeg input (index 2+)
+                        input_idx = len(extra_inputs) + 2  # 0=bg, 1=avatar, 2+=images
+                        extra_inputs.append((img_path, input_idx))
+                        # We'll add a complex filter post-loop that scales + overlays this image
+                        spec["image_input_idx"] = input_idx
+
+            # Regenerate bg WITHOUT title since per-scene titles handle it now
+            bg_img2 = _generate_background("", "")
+            bg_img2.save(bg_path, "PNG")
+
+            # Build image overlay filters (must be done in the [base][img]overlay format
+            # rather than as a single drawtext-style chain)
+        elif timed_bullets and bold_font:
+            # Legacy timed bullets path
+            for i, b in enumerate(timed_bullets):
+                text = (b.get("text") or "").strip()
+                if not text:
+                    continue
+                appear_at = max(0, float(b.get("appearAt") or 0))
+                y_pos = BULLETS_Y_START + i * BULLETS_LINE_HEIGHT
+                safe_text = escape_drawtext(text)
+                scene_filter_parts.append(
+                    f"drawbox=x={BULLET_X}:y={y_pos + 18}:w=20:h=4:color=0xb07ef8@1.0:t=fill:"
+                    f"enable='gte(t,{appear_at})'"
+                )
+                scene_filter_parts.append(
+                    f"drawtext=fontfile='{regular_font}':text='{safe_text}':"
+                    f"x={BULLET_X + 40}:y={y_pos}:fontsize={BULLET_FONT_SIZE}:fontcolor=0xd1d1d9:"
+                    f"enable='gte(t,{appear_at})'"
+                )
+
+        # Compose the filter graph
+        # Start: bg (input 0) + avatar (input 1) -> overlay -> [base]
+        # Then: apply text/box filters from scene_filter_parts to [base]
+        # Then: overlay each image input
+        text_chain = ("," + ",".join(scene_filter_parts)) if scene_filter_parts else ""
+
+        if extra_inputs:
+            # Build filter graph step by step with named labels
+            # [1:v] -> crop+scale -> [avatar]
+            # [0:v][avatar] -> overlay + text chain -> [base0]
+            # then for each image: [base_n][img:v] -> scale + overlay -> [base_{n+1}]
+            graph_parts = [
+                f"[1:v]crop={crop_w_src}:{crop_h_src}:{crop_x_src}:{crop_y_src},"
+                f"scale={AVATAR_W}:{AVATAR_H}:flags=lanczos[avatar]"
+            ]
+            graph_parts.append(
+                f"[0:v][avatar]overlay={AVATAR_X}:{AVATAR_Y}:shortest=1{text_chain}[base0]"
+            )
+
+            # Add overlay for each image
+            current_label = "base0"
+            for spec in scene_specs:
+                if "image_input_idx" not in spec:
+                    continue
+                input_idx = spec["image_input_idx"]
+                start = spec["start"]
+                end = spec["end"]
+                next_label = f"base_img{input_idx}"
+                # Scale image to fit IMAGE_MAX_W x IMAGE_MAX_H preserving aspect
+                graph_parts.append(
+                    f"[{input_idx}:v]scale={IMAGE_MAX_W}:{IMAGE_MAX_H}:force_original_aspect_ratio=decrease[img{input_idx}]"
+                )
+                graph_parts.append(
+                    f"[{current_label}][img{input_idx}]overlay={IMAGE_X}:{IMAGE_Y}:enable='between(t,{start:.2f},{end:.2f})'[{next_label}]"
+                )
+                current_label = next_label
+
+            graph_parts.append(f"[{current_label}]null[out]")
+            filter_complex = ";".join(graph_parts)
+        else:
+            # No image overlays — simple chain
+            filter_complex = (
+                f"[1:v]crop={crop_w_src}:{crop_h_src}:{crop_x_src}:{crop_y_src},"
+                f"scale={AVATAR_W}:{AVATAR_H}:flags=lanczos[avatar];"
+                f"[0:v][avatar]overlay={AVATAR_X}:{AVATAR_Y}:shortest=1{text_chain}[out]"
+            )
 
         cmd = [
             "ffmpeg", "-y",
             "-loop", "1", "-i", bg_path,  # input 0: background image (looped)
             "-i", avatar_path,             # input 1: avatar video
+        ]
+        # Extra image inputs (for image scenes)
+        for img_path, _idx in extra_inputs:
+            cmd.extend(["-loop", "1", "-i", img_path])
+
+        cmd.extend([
             "-filter_complex", filter_complex,
             "-map", "[out]",
             "-map", "1:a?",               # audio from avatar (optional)
@@ -667,7 +806,7 @@ def _compose_worker(job_id, avatar_video_url, title, bullets_text, round_corners
             "-b:a", "128k",
             "-shortest",
             output_path,
-        ]
+        ])
 
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
         if result.returncode != 0:
@@ -725,40 +864,66 @@ def compose_video():
         video_file = request.files['video']
         title = request.form.get("title", "")
         bullets = request.form.get("bullets", "")
+
+        # Parse scenes (modern format)
+        scenes_json = request.form.get("scenes", "")
+        scenes = []
+        if scenes_json:
+            try:
+                import json
+                scenes = json.loads(scenes_json)
+            except Exception:
+                scenes = []
+
+        # Parse legacy timedBullets (only used if no scenes provided)
         timed_bullets_json = request.form.get("timedBullets", "")
         timed_bullets = []
-        if timed_bullets_json:
+        if timed_bullets_json and not scenes:
             try:
                 import json
                 timed_bullets = json.loads(timed_bullets_json)
             except Exception:
                 timed_bullets = []
 
-        # Save uploaded video to a temp file the worker can read
+        # Save uploaded video and any scene images to temp dir
         temp_dir = tempfile.mkdtemp(prefix="upload_")
         upload_path = os.path.join(temp_dir, "avatar.mp4")
         video_file.save(upload_path)
 
+        # Save image attachments referenced by scenes
+        for scene in scenes:
+            ref = scene.get("imageRef")
+            if ref and ref in request.files:
+                img_file = request.files[ref]
+                ext = os.path.splitext(img_file.filename or "")[1] or ".png"
+                img_path = os.path.join(temp_dir, f"{ref}{ext}")
+                img_file.save(img_path)
+                scene["imagePath"] = img_path  # local path for worker
+
         job_id = str(uuid.uuid4())
         _update_job(job_id, status="queued")
 
-        # Pass local file path to worker (with file:// scheme so worker knows to skip download)
         thread = threading.Thread(
             target=_compose_worker,
             args=(job_id, "file://" + upload_path, title, bullets),
-            kwargs={"upload_temp_dir": temp_dir, "timed_bullets": timed_bullets},
+            kwargs={
+                "upload_temp_dir": temp_dir,
+                "timed_bullets": timed_bullets,
+                "scenes": scenes,
+            },
             daemon=True,
         )
         thread.start()
 
         return jsonify({"job_id": job_id, "status": "queued"}), 200
 
-    # JSON URL mode (legacy)
+    # JSON URL mode (legacy — no scene support, just timedBullets)
     body = request.get_json() or {}
     video_url = body.get("video_url")
     title = body.get("title", "")
     bullets = body.get("bullets", "")
     timed_bullets = body.get("timedBullets", []) or []
+    scenes = body.get("scenes", []) or []
 
     if not video_url:
         return jsonify({"error": "video_url required (or upload 'video' as multipart)"}), 400
@@ -769,7 +934,7 @@ def compose_video():
     thread = threading.Thread(
         target=_compose_worker,
         args=(job_id, video_url, title, bullets),
-        kwargs={"timed_bullets": timed_bullets},
+        kwargs={"timed_bullets": timed_bullets, "scenes": scenes},
         daemon=True,
     )
     thread.start()
