@@ -695,21 +695,33 @@ def _compose_worker(job_id, avatar_video_url, title, bullets_text, round_corners
                 stype = scene.get("type") or "bullets"
                 if stype == "bullets":
                     bullets_list = scene.get("bullets") or []
-                    for j, btext in enumerate(bullets_list):
-                        btext = (btext or "").strip()
+                    for j, b in enumerate(bullets_list):
+                        # Bullets can be strings (legacy) or objects {text, appearAt}
+                        if isinstance(b, str):
+                            btext = b.strip()
+                            bullet_appear_at = start  # legacy: appears at scene start
+                        elif isinstance(b, dict):
+                            btext = (b.get("text") or "").strip()
+                            bullet_appear_at = max(start, float(b.get("appearAt") or start))
+                        else:
+                            continue
+
                         if not btext:
                             continue
+
+                        # Each bullet stays visible from its appearAt until scene end
+                        bullet_filter = f"between(t,{bullet_appear_at:.2f},{end:.2f})"
                         y_pos = BULLETS_Y_START + j * BULLETS_LINE_HEIGHT
                         bullet_path = text_to_file(btext)
 
                         scene_filter_parts.append(
                             f"drawbox=x={BULLET_X}:y={y_pos + 18}:w=20:h=4:color=0xb07ef8@1.0:t=fill:"
-                            f"enable='{t_filter}'"
+                            f"enable='{bullet_filter}'"
                         )
                         scene_filter_parts.append(
                             f"drawtext=fontfile='{regular_font}':textfile='{bullet_path}':"
                             f"x={BULLET_X + 40}:y={y_pos}:fontsize={BULLET_FONT_SIZE}:fontcolor=0xd1d1d9:"
-                            f"enable='{t_filter}'"
+                            f"enable='{bullet_filter}'"
                         )
                 elif stype == "image" and scene.get("imagePath"):
                     img_path = scene["imagePath"]
