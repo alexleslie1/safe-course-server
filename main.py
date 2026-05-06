@@ -327,16 +327,44 @@ TEXT_COLOR = (255, 255, 255)
 BULLET_COLOR = (176, 126, 248)  # #b07ef8
 MUTED_COLOR = (209, 209, 217)
 
-# Avatar video position (left side of canvas) - 3:4 aspect ratio
-AVATAR_W = 700
-AVATAR_H = 933  # 3:4 aspect ratio
-AVATAR_X = 120
-AVATAR_Y = (CANVAS_H - AVATAR_H) // 2
+# Avatar video position (left column, fixed across all scenes)
+AVATAR_W = 580
+AVATAR_H = 773
+AVATAR_X = 80
+AVATAR_Y = 160
 
-# Text area (right side of canvas)
-TEXT_X = 900
-TEXT_Y_START = 300
-TEXT_MAX_WIDTH = CANVAS_W - TEXT_X - 120
+# Title strip across the top (centered horizontally)
+TITLE_BAR_Y = 60
+TITLE_BAR_FONT_SIZE = 56
+
+# === LAYOUT 1: STANDARD (avatar + ONE content column on the right) ===
+# Used for bullets-only OR image-only scenes
+STD_CONTENT_X = 720       # left edge of content area (right of avatar)
+STD_CONTENT_Y = 200       # top of content area
+STD_CONTENT_W = 1120      # width — fills from end of avatar to canvas right margin
+STD_CONTENT_H = 720
+# Image when alone in standard layout
+STD_IMAGE_W = 1100
+STD_IMAGE_H = 700
+# Bullets when alone in standard layout (wide column)
+STD_BULLETS_FONT = 32
+
+# === LAYOUT 2: TRIPLE (avatar + bullets + image, three columns) ===
+# Used for mixed scenes (bullets AND image together)
+TRIPLE_BULLETS_X = 720
+TRIPLE_BULLETS_Y = 200
+TRIPLE_BULLETS_W = 540    # narrower middle column
+TRIPLE_BULLETS_FONT = 26
+TRIPLE_IMAGE_X = 1300
+TRIPLE_IMAGE_Y = 200
+TRIPLE_IMAGE_W = 540
+TRIPLE_IMAGE_H = 720
+
+# Legacy aliases used by the static-background generator (no scenes mode)
+TITLE_BAR_X = 80
+TEXT_X = STD_CONTENT_X
+TEXT_Y_START = STD_CONTENT_Y
+TEXT_MAX_WIDTH = STD_CONTENT_W
 
 # In-memory job store (simple dict, since we don't need persistence
 # across restarts for single-user use)
@@ -457,23 +485,27 @@ def _detect_face_focal(video_path):
 
 def _generate_background(title, bullets_text):
     """
-    Build the dark-purple background image with title and bullets.
+    Build the dark-purple background image with title strip and bullets.
     Returns a PIL Image at CANVAS_W x CANVAS_H.
+    Layout: title across the top, bullets in middle column below.
     """
     img = Image.new("RGB", (CANVAS_W, CANVAS_H), BG_COLOR_RGB)
     draw = ImageDraw.Draw(img)
 
-    # Optional: subtle purple glow behind text area
-    # (Drawing a radial gradient is expensive; skip for now - solid bg is fine)
-
-    # Draw the title
-    title_font = _get_font(56, bold=True)
-    title_lines = _wrap_text(title or "", title_font, TEXT_MAX_WIDTH)
-    y = TEXT_Y_START
+    # Title — centered horizontally at the top of the canvas
+    title_font = _get_font(TITLE_BAR_FONT_SIZE, bold=True)
+    title_lines = _wrap_text(title or "", title_font, CANVAS_W - 160)
+    y = TITLE_BAR_Y
     for line in title_lines:
-        draw.text((TEXT_X, y), line, font=title_font, fill=TEXT_COLOR)
+        # Compute text width to center it
+        try:
+            bbox = draw.textbbox((0, 0), line, font=title_font)
+            tw = bbox[2] - bbox[0]
+        except Exception:
+            tw = len(line) * (TITLE_BAR_FONT_SIZE // 2)
+        cx = (CANVAS_W - tw) // 2
+        draw.text((cx, y), line, font=title_font, fill=TEXT_COLOR)
         y += 72
-    y += 30  # space after title
 
     # Parse bullets (split by line, strip common bullet prefixes)
     bullet_lines = []
@@ -481,24 +513,20 @@ def _generate_background(title, bullets_text):
         stripped = raw.strip()
         if not stripped:
             continue
-        # Remove common prefix chars like -, •, *, ✓, etc.
         cleaned = stripped.lstrip("-•*✓✔→▸· \t")
         bullet_lines.append(cleaned)
 
-    # Draw bullets
-    bullet_font = _get_font(30)
+    # Bullets are drawn in the middle column starting at TEXT_Y_START
+    bullet_font = _get_font(26)
+    y = TEXT_Y_START
     for bullet in bullet_lines:
         wrapped = _wrap_text(bullet, bullet_font, TEXT_MAX_WIDTH - 60)
-        # Gradient bullet marker (simplified: solid colored rectangle)
-        draw.rectangle([TEXT_X, y + 18, TEXT_X + 30, y + 22], fill=BULLET_COLOR)
-
-        # Bullet text
-        for i, line in enumerate(wrapped):
-            draw.text((TEXT_X + 50, y), line, font=bullet_font, fill=MUTED_COLOR)
-            y += 44
-        y += 22  # spacing between bullets
-        # Thin separator line
-        draw.line([(TEXT_X, y), (CANVAS_W - 120, y)], fill=(255, 255, 255, 20), width=1)
+        draw.rectangle([TEXT_X, y + 16, TEXT_X + 26, y + 20], fill=BULLET_COLOR)
+        for line in wrapped:
+            draw.text((TEXT_X + 40, y), line, font=bullet_font, fill=MUTED_COLOR)
+            y += 38
+        y += 20
+        draw.line([(TEXT_X, y), (TEXT_X + TEXT_MAX_WIDTH, y)], fill=(255, 255, 255, 20), width=1)
         y += 14
 
     return img
@@ -646,18 +674,19 @@ def _compose_worker(job_id, avatar_video_url, title, bullets_text, round_corners
                 f.write(s)
             return path
 
-        # Layout constants matching the SCORM player look
-        TITLE_X = 900
-        TITLE_Y = 300
-        TITLE_FONT_SIZE = 56
-        BULLETS_Y_START = 420
+        # Layout constants for 3-column design:
+        # Title across top, then Avatar | Bullets | Image columns below
+        TITLE_X = TITLE_BAR_X       # full-width title at top
+        TITLE_Y = TITLE_BAR_Y
+        TITLE_FONT_SIZE = TITLE_BAR_FONT_SIZE
+        BULLETS_Y_START = STD_CONTENT_Y   # legacy fallback uses Standard layout
         BULLETS_LINE_HEIGHT = 80
-        BULLET_X = 900
-        BULLET_FONT_SIZE = 30
-        IMAGE_X = 900
-        IMAGE_Y = 250
-        IMAGE_MAX_W = 880
-        IMAGE_MAX_H = 600
+        BULLET_X = STD_CONTENT_X
+        BULLET_FONT_SIZE = STD_BULLETS_FONT
+        IMAGE_X = STD_CONTENT_X       # legacy/fallback mode uses Standard layout
+        IMAGE_Y = STD_CONTENT_Y
+        IMAGE_MAX_W = STD_IMAGE_W
+        IMAGE_MAX_H = STD_IMAGE_H
 
         scene_filter_parts = []
         extra_inputs = []   # list of (path, ffmpeg_input_index)
@@ -688,7 +717,7 @@ def _compose_worker(job_id, avatar_video_url, title, bullets_text, round_corners
                     title_path = text_to_file(scene_title)
                     scene_filter_parts.append(
                         f"drawtext=fontfile='{bold_font}':textfile='{title_path}':"
-                        f"x={TITLE_X}:y={TITLE_Y}:fontsize={TITLE_FONT_SIZE}:fontcolor=white:"
+                        f"x=(w-text_w)/2:y={TITLE_Y}:fontsize={TITLE_FONT_SIZE}:fontcolor=white:"
                         f"enable='{t_filter}'"
                     )
 
@@ -702,11 +731,35 @@ def _compose_worker(job_id, avatar_video_url, title, bullets_text, round_corners
                 bullet_y_index = 0
 
                 if elements_list:
+                    # Detect what's in this scene to choose between Standard and Triple layouts
+                    has_bullet = any(isinstance(e, dict) and e.get("kind") == "bullet" and (e.get("text") or "").strip() for e in elements_list)
+                    has_image = any(isinstance(e, dict) and e.get("kind") == "image" and e.get("imagePath") for e in elements_list)
+
+                    if has_bullet and has_image:
+                        # TRIPLE layout — narrow bullets in middle, image in right column
+                        bullet_x = TRIPLE_BULLETS_X
+                        bullet_y_start = TRIPLE_BULLETS_Y
+                        bullet_font_size = TRIPLE_BULLETS_FONT
+                        bullet_line_height = 70
+                        scene_image_x = TRIPLE_IMAGE_X
+                        scene_image_y = TRIPLE_IMAGE_Y
+                        scene_image_max_w = TRIPLE_IMAGE_W
+                        scene_image_max_h = TRIPLE_IMAGE_H
+                    else:
+                        # STANDARD layout — bullets fill the full content area, OR image fills it
+                        bullet_x = STD_CONTENT_X
+                        bullet_y_start = STD_CONTENT_Y
+                        bullet_font_size = STD_BULLETS_FONT
+                        bullet_line_height = 80
+                        scene_image_x = STD_CONTENT_X
+                        scene_image_y = STD_CONTENT_Y
+                        scene_image_max_w = STD_IMAGE_W
+                        scene_image_max_h = STD_IMAGE_H
+
                     for el in elements_list:
                         if not isinstance(el, dict):
                             continue
                         kind = el.get("kind")
-                        # Element appears at its own time, stays till scene end
                         el_appear_at = max(start, float(el.get("appearAt") or start))
                         el_filter = f"between(t,{el_appear_at:.2f},{end:.2f})"
 
@@ -714,16 +767,18 @@ def _compose_worker(job_id, avatar_video_url, title, bullets_text, round_corners
                             btext = (el.get("text") or "").strip()
                             if not btext:
                                 continue
-                            y_pos = BULLETS_Y_START + bullet_y_index * BULLETS_LINE_HEIGHT
+                            y_pos = bullet_y_start + bullet_y_index * bullet_line_height
                             bullet_y_index += 1
                             bullet_path = text_to_file(btext)
+                            # Scale bullet marker proportionally to font size
+                            marker_offset_y = bullet_font_size // 2 + 4
                             scene_filter_parts.append(
-                                f"drawbox=x={BULLET_X}:y={y_pos + 18}:w=20:h=4:color=0xb07ef8@1.0:t=fill:"
+                                f"drawbox=x={bullet_x}:y={y_pos + marker_offset_y}:w=20:h=4:color=0xb07ef8@1.0:t=fill:"
                                 f"enable='{el_filter}'"
                             )
                             scene_filter_parts.append(
                                 f"drawtext=fontfile='{regular_font}':textfile='{bullet_path}':"
-                                f"x={BULLET_X + 40}:y={y_pos}:fontsize={BULLET_FONT_SIZE}:fontcolor=0xd1d1d9:"
+                                f"x={bullet_x + 40}:y={y_pos}:fontsize={bullet_font_size}:fontcolor=0xd1d1d9:"
                                 f"enable='{el_filter}'"
                             )
                         elif kind == "image" and el.get("imagePath"):
@@ -731,11 +786,14 @@ def _compose_worker(job_id, avatar_video_url, title, bullets_text, round_corners
                             if os.path.exists(img_path):
                                 input_idx = len(extra_inputs) + 2  # 0=bg, 1=avatar, 2+=images
                                 extra_inputs.append((img_path, input_idx))
-                                # Stash for image overlay loop below
                                 spec.setdefault("image_overlays", []).append({
                                     "input_idx": input_idx,
                                     "appear_at": el_appear_at,
                                     "end": end,
+                                    "x": scene_image_x,
+                                    "y": scene_image_y,
+                                    "max_w": scene_image_max_w,
+                                    "max_h": scene_image_max_h,
                                 })
                 else:
                     # Legacy fallback: scene had old 'bullets' or 'imagePath' fields
@@ -829,13 +887,17 @@ def _compose_worker(job_id, avatar_video_url, title, bullets_text, round_corners
                     input_idx = overlay["input_idx"]
                     appear_at = overlay["appear_at"]
                     overlay_end = overlay["end"]
+                    # Per-overlay layout (mixed scenes get smaller image to leave room for bullets)
+                    ov_x = overlay.get("x", IMAGE_X)
+                    ov_y = overlay.get("y", IMAGE_Y)
+                    ov_w = overlay.get("max_w", IMAGE_MAX_W)
+                    ov_h = overlay.get("max_h", IMAGE_MAX_H)
                     next_label = f"base_img{input_idx}"
-                    # Scale image to fit IMAGE_MAX_W x IMAGE_MAX_H preserving aspect
                     graph_parts.append(
-                        f"[{input_idx}:v]scale={IMAGE_MAX_W}:{IMAGE_MAX_H}:force_original_aspect_ratio=decrease[img{input_idx}]"
+                        f"[{input_idx}:v]scale={ov_w}:{ov_h}:force_original_aspect_ratio=decrease[img{input_idx}]"
                     )
                     graph_parts.append(
-                        f"[{current_label}][img{input_idx}]overlay={IMAGE_X}:{IMAGE_Y}:enable='between(t,{appear_at:.2f},{overlay_end:.2f})'[{next_label}]"
+                        f"[{current_label}][img{input_idx}]overlay={ov_x}:{ov_y}:enable='between(t,{appear_at:.2f},{overlay_end:.2f})'[{next_label}]"
                     )
                     current_label = next_label
 
