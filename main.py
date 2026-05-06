@@ -692,45 +692,90 @@ def _compose_worker(job_id, avatar_video_url, title, bullets_text, round_corners
                         f"enable='{t_filter}'"
                     )
 
-                stype = scene.get("type") or "bullets"
-                if stype == "bullets":
-                    bullets_list = scene.get("bullets") or []
-                    for j, b in enumerate(bullets_list):
-                        # Bullets can be strings (legacy) or objects {text, appearAt}
-                        if isinstance(b, str):
-                            btext = b.strip()
-                            bullet_appear_at = start  # legacy: appears at scene start
-                        elif isinstance(b, dict):
-                            btext = (b.get("text") or "").strip()
-                            bullet_appear_at = max(start, float(b.get("appearAt") or start))
-                        else:
+                # Iterate elements (modern data model) OR fall back to legacy
+                # bullets/image fields if no elements array is present
+                elements_list = scene.get("elements")
+                if not isinstance(elements_list, list):
+                    elements_list = None
+
+                # Track bullet position so they stack vertically across the scene
+                bullet_y_index = 0
+
+                if elements_list:
+                    for el in elements_list:
+                        if not isinstance(el, dict):
                             continue
+                        kind = el.get("kind")
+                        # Element appears at its own time, stays till scene end
+                        el_appear_at = max(start, float(el.get("appearAt") or start))
+                        el_filter = f"between(t,{el_appear_at:.2f},{end:.2f})"
 
-                        if not btext:
-                            continue
-
-                        # Each bullet stays visible from its appearAt until scene end
-                        bullet_filter = f"between(t,{bullet_appear_at:.2f},{end:.2f})"
-                        y_pos = BULLETS_Y_START + j * BULLETS_LINE_HEIGHT
-                        bullet_path = text_to_file(btext)
-
-                        scene_filter_parts.append(
-                            f"drawbox=x={BULLET_X}:y={y_pos + 18}:w=20:h=4:color=0xb07ef8@1.0:t=fill:"
-                            f"enable='{bullet_filter}'"
-                        )
-                        scene_filter_parts.append(
-                            f"drawtext=fontfile='{regular_font}':textfile='{bullet_path}':"
-                            f"x={BULLET_X + 40}:y={y_pos}:fontsize={BULLET_FONT_SIZE}:fontcolor=0xd1d1d9:"
-                            f"enable='{bullet_filter}'"
-                        )
-                elif stype == "image" and scene.get("imagePath"):
-                    img_path = scene["imagePath"]
-                    if os.path.exists(img_path):
-                        # Each image becomes an extra ffmpeg input (index 2+)
-                        input_idx = len(extra_inputs) + 2  # 0=bg, 1=avatar, 2+=images
-                        extra_inputs.append((img_path, input_idx))
-                        # We'll add a complex filter post-loop that scales + overlays this image
-                        spec["image_input_idx"] = input_idx
+                        if kind == "bullet":
+                            btext = (el.get("text") or "").strip()
+                            if not btext:
+                                continue
+                            y_pos = BULLETS_Y_START + bullet_y_index * BULLETS_LINE_HEIGHT
+                            bullet_y_index += 1
+                            bullet_path = text_to_file(btext)
+                            scene_filter_parts.append(
+                                f"drawbox=x={BULLET_X}:y={y_pos + 18}:w=20:h=4:color=0xb07ef8@1.0:t=fill:"
+                                f"enable='{el_filter}'"
+                            )
+                            scene_filter_parts.append(
+                                f"drawtext=fontfile='{regular_font}':textfile='{bullet_path}':"
+                                f"x={BULLET_X + 40}:y={y_pos}:fontsize={BULLET_FONT_SIZE}:fontcolor=0xd1d1d9:"
+                                f"enable='{el_filter}'"
+                            )
+                        elif kind == "image" and el.get("imagePath"):
+                            img_path = el["imagePath"]
+                            if os.path.exists(img_path):
+                                input_idx = len(extra_inputs) + 2  # 0=bg, 1=avatar, 2+=images
+                                extra_inputs.append((img_path, input_idx))
+                                # Stash for image overlay loop below
+                                spec.setdefault("image_overlays", []).append({
+                                    "input_idx": input_idx,
+                                    "appear_at": el_appear_at,
+                                    "end": end,
+                                })
+                else:
+                    # Legacy fallback: scene had old 'bullets' or 'imagePath' fields
+                    stype = scene.get("type") or "bullets"
+                    if stype == "bullets":
+                        bullets_list = scene.get("bullets") or []
+                        for b in bullets_list:
+                            if isinstance(b, str):
+                                btext = b.strip()
+                                bullet_appear_at = start
+                            elif isinstance(b, dict):
+                                btext = (b.get("text") or "").strip()
+                                bullet_appear_at = max(start, float(b.get("appearAt") or start))
+                            else:
+                                continue
+                            if not btext:
+                                continue
+                            bullet_filter = f"between(t,{bullet_appear_at:.2f},{end:.2f})"
+                            y_pos = BULLETS_Y_START + bullet_y_index * BULLETS_LINE_HEIGHT
+                            bullet_y_index += 1
+                            bullet_path = text_to_file(btext)
+                            scene_filter_parts.append(
+                                f"drawbox=x={BULLET_X}:y={y_pos + 18}:w=20:h=4:color=0xb07ef8@1.0:t=fill:"
+                                f"enable='{bullet_filter}'"
+                            )
+                            scene_filter_parts.append(
+                                f"drawtext=fontfile='{regular_font}':textfile='{bullet_path}':"
+                                f"x={BULLET_X + 40}:y={y_pos}:fontsize={BULLET_FONT_SIZE}:fontcolor=0xd1d1d9:"
+                                f"enable='{bullet_filter}'"
+                            )
+                    elif stype == "image" and scene.get("imagePath"):
+                        img_path = scene["imagePath"]
+                        if os.path.exists(img_path):
+                            input_idx = len(extra_inputs) + 2
+                            extra_inputs.append((img_path, input_idx))
+                            spec.setdefault("image_overlays", []).append({
+                                "input_idx": input_idx,
+                                "appear_at": start,
+                                "end": end,
+                            })
 
             # Regenerate bg WITHOUT title since per-scene titles handle it now
             bg_img2 = _generate_background("", "")
@@ -776,23 +821,23 @@ def _compose_worker(job_id, avatar_video_url, title, bullets_text, round_corners
                 f"[0:v][avatar]overlay={AVATAR_X}:{AVATAR_Y}:shortest=1{text_chain}[base0]"
             )
 
-            # Add overlay for each image
+            # Add overlay for each image element across all scenes
             current_label = "base0"
             for spec in scene_specs:
-                if "image_input_idx" not in spec:
-                    continue
-                input_idx = spec["image_input_idx"]
-                start = spec["start"]
-                end = spec["end"]
-                next_label = f"base_img{input_idx}"
-                # Scale image to fit IMAGE_MAX_W x IMAGE_MAX_H preserving aspect
-                graph_parts.append(
-                    f"[{input_idx}:v]scale={IMAGE_MAX_W}:{IMAGE_MAX_H}:force_original_aspect_ratio=decrease[img{input_idx}]"
-                )
-                graph_parts.append(
-                    f"[{current_label}][img{input_idx}]overlay={IMAGE_X}:{IMAGE_Y}:enable='between(t,{start:.2f},{end:.2f})'[{next_label}]"
-                )
-                current_label = next_label
+                overlays = spec.get("image_overlays") or []
+                for overlay in overlays:
+                    input_idx = overlay["input_idx"]
+                    appear_at = overlay["appear_at"]
+                    overlay_end = overlay["end"]
+                    next_label = f"base_img{input_idx}"
+                    # Scale image to fit IMAGE_MAX_W x IMAGE_MAX_H preserving aspect
+                    graph_parts.append(
+                        f"[{input_idx}:v]scale={IMAGE_MAX_W}:{IMAGE_MAX_H}:force_original_aspect_ratio=decrease[img{input_idx}]"
+                    )
+                    graph_parts.append(
+                        f"[{current_label}][img{input_idx}]overlay={IMAGE_X}:{IMAGE_Y}:enable='between(t,{appear_at:.2f},{overlay_end:.2f})'[{next_label}]"
+                    )
+                    current_label = next_label
 
             graph_parts.append(f"[{current_label}]null[out]")
             filter_complex = ";".join(graph_parts)
@@ -909,15 +954,26 @@ def compose_video():
         upload_path = os.path.join(temp_dir, "avatar.mp4")
         video_file.save(upload_path)
 
-        # Save image attachments referenced by scenes
+        # Save image attachments referenced by scenes (and by individual elements)
         for scene in scenes:
+            # Legacy scene-level imageRef
             ref = scene.get("imageRef")
             if ref and ref in request.files:
                 img_file = request.files[ref]
                 ext = os.path.splitext(img_file.filename or "")[1] or ".png"
                 img_path = os.path.join(temp_dir, f"{ref}{ext}")
                 img_file.save(img_path)
-                scene["imagePath"] = img_path  # local path for worker
+                scene["imagePath"] = img_path
+
+            # New: per-element imageRef inside elements array
+            for el in scene.get("elements", []) or []:
+                el_ref = el.get("imageRef")
+                if el_ref and el_ref in request.files:
+                    el_img_file = request.files[el_ref]
+                    el_ext = os.path.splitext(el_img_file.filename or "")[1] or ".png"
+                    el_img_path = os.path.join(temp_dir, f"{el_ref}{el_ext}")
+                    el_img_file.save(el_img_path)
+                    el["imagePath"] = el_img_path
 
         job_id = str(uuid.uuid4())
         _update_job(job_id, status="queued")
